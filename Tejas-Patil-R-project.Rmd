@@ -1,0 +1,363 @@
+---
+title: "U.S. Securities and Exchange Commission"
+author: "Tejas Patil"
+output: html_document
+---
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+
+
+## Data Acquisition: Web Scraping in Python
+
+The data is extracted from the official website - https://www.sec.gov/litigation/litreleases.shtml
+
+
+Extracted text in Python using "Beautiful Soup" library and stored in csv format.
+
+```{r}
+library(dplyr)
+library(readr)
+
+temp = list.files(path = "G:/data science/sec/updated_files", pattern = "*.csv")
+
+df_raw = lapply(temp, read_csv) %>% bind_rows()
+df_raw = df_raw[,-c(1,6)]
+
+
+#convert Date column to Date type in R
+df_raw$Date = as.Date(as.character(df_raw$Date), "%m/%d/%Y")
+
+print(head(df_raw))
+```
+
+## Analysis
+
+```{r}
+library(tm)
+library(NLP)
+corp = Corpus(VectorSource(df_raw$Text))
+corp2 = tm_map(corp, tolower)
+corp2 = tm_map(corp2, removeWords, stopwords("english"))
+corp2 = tm_map(corp2, stemDocument)
+```
+
+
+```{r}
+corp = tm_map(corp, removeWords, stopwords("english"))
+corp = tm_map(corp, stemDocument)
+tdm = TermDocumentMatrix(corp)
+termDocMatrix = as.matrix(tdm)
+freq = sort(rowSums(termDocMatrix), decreasing = TRUE)
+
+
+library(wordcloud)
+library(RColorBrewer)
+wordcount = freq
+word50 = wordcount[10:65]  #top words contain security, commission, etc. which are in every article
+
+tdm_names = names(word50)
+wordcloud(tdm_names,word50, min.freq=250, scale=c(5, .1), colors=brewer.pal(6, "Dark2"))
+
+```
+
+## Lawsuit Categorization
+
+```{r}
+library(magrittr)
+library(text2vec)
+library(servr)
+
+frame_corpus = data.frame(text=unlist(sapply(corp, `[[`, "content")),stringsAsFactors=FALSE)
+
+tokens = frame_corpus$text %>% tolower %>% word_tokenizer()
+it = itoken(tokens)
+v = create_vocabulary(it) %>%
+  prune_vocabulary(term_count_min=5)
+vectrzr = vocab_vectorizer(v, grow_dtm = TRUE, skip_grams_window = 5)
+dtm = create_dtm(it, vectrzr)
+
+## DO LDA
+lda = LatentDirichletAllocation$new(n_topics=5, v)
+lda$fit(dtm,n_iter = 50)
+doc_topics = lda$fit_transform(dtm,n_iter = 50)
+topic_wv = lda$get_word_vectors()
+
+topics1 = as.data.frame(doc_topics)
+topics = colnames(topics1)[max.col(topics1,ties.method="first")]
+topics = as.data.frame(topics)
+df_raw['Category'] = topics
+
+```
+
+The categories may be defined as:
+
+1. Disputes over real property (with most negative sentiments)
+2. Breach of contract Claims
+3. Tort claims
+4. Landlords and tenant disputes 
+5. Divorce and family law cases
+
+
+## Total Litigations per year by Category
+
+```{r}
+library(data.table)
+tbl = as.data.table(df_raw)
+
+tbl$count = 1
+
+tot_lit_year = tbl[, sum(count), keyby=.(format(tbl$Date, "%Y"), Category)]
+
+head(tot_lit_year)
+
+library(reshape)
+df2 <- cast(tot_lit_year, format~Category)
+
+plot(df2$format, df2$V1, xlab = "Year", ylab = "Number of Litigations", type = "l", lwd = 2, col = "blue", ylim = c(0, max(max(c(df2$V1,df2$V2,df2$V3,df2$V4,df2$V5)))))
+
+points(df2$format, df2$V2, type = "l", lwd = 2, col = "red")
+points(df2$format, df2$V3, type = "l", lwd = 2, col = "yellow")
+points(df2$format, df2$V4, type = "l", lwd = 2, col = "green")
+points(df2$format, df2$V5, type = "l", lwd = 2, col = "orange")
+
+legend("topright",legend=colnames(df2[,2:6]),col=c("blue","red","yellow","green","orange"),bg="white",lwd=2)
+```
+
+## Mood Scoring
+
+```{r}
+HIDict = readLines("G:/data science/sec/inqdict.txt")
+dict_pos = HIDict[grep("Pos",HIDict)]
+dict_neg = HIDict[grep("Neg",HIDict)]
+posv_words = NULL
+negv_words = NULL
+
+
+for (s in dict_pos) {
+    s = strsplit(s,"#")[[1]][1]
+    posv_words = c(posv_words,strsplit(s," ")[[1]][1])
+}
+
+for (s in dict_neg) {
+    s = strsplit(s,"#")[[1]][1]
+    negv_words = c(negv_words,strsplit(s," ")[[1]][1])
+}
+
+posv_words = tolower(posv_words)
+negv_words = tolower(negv_words)
+
+positive_score = function(rw){
+  rw <- tolower(rw)
+  rw = array(unlist(strsplit(rw," ")))
+  posv_match = match(rw,posv_words)
+  no_posv_match = length(posv_match[which(posv_match>0)])
+  return(no_posv_match)
+}
+
+negative_score = function(rw){
+  rw <- tolower(rw)
+  rw = array(unlist(strsplit(rw," ")))
+  negv_match = match(rw,negv_words)
+  no_negv_match = length(negv_match[which(negv_match>0)])
+  return(no_negv_match)
+}
+
+df_raw["Positive Score"] = as.integer(lapply(df_raw$Text, positive_score))
+df_raw["Negative Score"] = as.integer(lapply(df_raw$Text, negative_score))
+df_raw["Total Score"] = df_raw$`Positive Score` - df_raw$`Negative Score`
+print(head(df_raw))
+```
+
+## Calculating total frauds and penalties (monetary)
+
+```{r}
+library(quanteda)
+
+calcPenalty = function(litigation){
+  penaltyWordlist = c("pay", "disgorgement", "penalty", "interest")
+  fraudWordlist = c("made", "rais")
+  totalpenalty = 0
+  
+  x = kwic(litigation, keywords = "$")
+  if(length(x$position != 0)){
+    for(i in 1:length(x$position)){
+      if(any(sapply(penaltyWordlist, grepl, x$contextPre[[i]]) == TRUE)){
+        if(strsplit(x$contextPost, " ")[[i]][2] == "million")
+          totalpenalty = totalpenalty + (as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1] )) * 1000000)
+        
+        else if(strsplit(x$contextPost, " ")[[i]][2] == "billion")
+          totalpenalty = totalpenalty + (as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1] )) * 1000000000)
+          
+        else
+          totalpenalty = totalpenalty + as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1]))
+      }
+    }
+  }
+  return(totalpenalty)
+}
+
+calcFraud = function(litigation){
+  penaltyWordlist = c("pay", "disgorgement", "penalty", "interest", "forfeit")
+  fraudWordlist = c("made", "raised", "rais")
+  totalfraud = 0
+  
+  x = kwic(litigation, keywords = "$")
+  if(length(x$position != 0)){
+    for(i in 1:length(x$position)){
+      if(any(sapply(fraudWordlist, grepl, x$contextPre[[i]]) == TRUE)){
+        if(strsplit(x$contextPost, " ")[[i]][2] == "million")
+          totalfraud = totalfraud + (as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1] )) * 1000000)
+        
+        else if(strsplit(x$contextPost, " ")[[i]][2] == "billion")
+          totalfraud = totalfraud + (as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1] )) * 1000000000)
+          
+        else
+          totalfraud = totalfraud + as.numeric(gsub(",","",strsplit(x$contextPost, " ")[[i]][1] ))
+      }
+    }
+  }
+  return(totalfraud)
+}
+
+df_raw$Penalty = as.numeric(lapply(as.character(corp2$content), calcPenalty))
+df_raw$Penalty[is.na(df_raw$Penalty)] = 0
+df_raw$Fraud = as.numeric(lapply(as.character(corp2$content), calcFraud))
+
+print(head(df_raw[,c("Fraud", "Penalty")]))
+```
+
+## Scatter Plot (Negative Score vs Penalty amount)
+
+```{r}
+cor_df = df_raw[,c(7,9)]
+print(cor(cor_df))
+
+#remmoving outliers
+yout = cor_df$Penalty > 5000000
+plot(cor_df$`Negative Score`[!yout], cor_df$Penalty[!yout], xlab = "Negative Score", ylab = "Penalty in $(million)", axes=FALSE)
+axis(side = 2, at = c(0,1000000,2000000,3000000,4000000,5000000), labels = c(0,1,2,3,4,5), las = 2)
+axis(side = 1, at = seq(0,60,10), labels = seq(0,60,10))
+
+```
+We can see that there is an increase in the penalty amount with the increase in Negative Sentiment Score.
+
+## Trend of Frauds over the years
+
+```{r}
+tbl = as.data.table(df_raw)
+
+dfAggrPenalty = tbl[, mean(Penalty), keyby=.(format(tbl$Date, "%Y-%m"))]
+
+
+library(ggplot2)
+library(scales)
+
+testDF = as.data.table(df_raw[,c("Date", "Fraud", "Penalty")])
+
+ggplot(data = testDF,
+  aes(as.Date(testDF$Date), testDF$Fraud)) +
+  ggtitle("Frauds over years") +
+  stat_summary(fun.y = mean, # adds up all observations for the month
+    geom = "line") +
+  scale_x_date(
+    labels = date_format("%y"),
+    breaks = date_breaks("year")) +
+  scale_y_continuous(
+    labels = function(x){return (x/1000000)}) +
+  labs(x="Years", y="$(Millions)")
+```
+
+This graph shows frauds on a daily basis. To improve the analysis, a graph of average Frauds per year is plotted as below.
+
+
+```{r}
+dfAggrFraud = tbl[, mean(Fraud), keyby=(format(Date, "%Y"))]
+
+ggplot() + geom_line(data=data.frame(dfAggrFraud), 
+                     aes(x=format, y=dfAggrFraud$V1, group = 1), 
+                     colour='blue')+
+  labs(x="Years", y="$(Millions)")+
+  scale_y_continuous(
+    labels = function(x){return (x/1000000)})+
+  ggtitle("Average Fraud amounts over Years")
+```
+
+There's a sudden uprise after 2008. This may be due to the recession, that the invested money is not returned.
+
+## Penalties over years
+
+```{r}
+library(zoo)
+
+#removing two outliers
+dfAggrPenalty = dfAggrPenalty[dfAggrPenalty$V1 < 50000000000]
+
+ggplot() + geom_line(data=data.frame(dfAggrPenalty), 
+                     aes(x=as.Date(as.yearmon(dfAggrPenalty$format)), y=dfAggrPenalty$V1, group = 1), 
+                     colour='blue')+
+  labs(x="Years", y="$(Millions)")+
+  scale_y_continuous(
+    labels = function(x){return (x/1000000)}) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  ggtitle("Average Penalty amounts over Months")
+```
+
+## Naive Bayes Classification
+
+```{r}
+library(caret)
+library(klaR)
+
+# define an 70%/30% train/test split of the dataset
+
+split=0.70
+trainIndex <- createDataPartition(df_raw$Category, p=split, list=FALSE)
+data_train <- df_raw[ trainIndex,]
+data_test <- df_raw[-trainIndex,]
+
+data_train <- df_raw[,5:8]
+
+# train a naive bayes model
+model <- NaiveBayes(Category~., data=data_train)
+plot(model)
+
+# make predictions
+x_test <- data_test[,6:8]
+y_test <- data_test$Category
+predictions <- predict(model, x_test)
+
+# summarize results
+confusionMatrix(predictions$class, y_test)
+```
+
+
+## Support Vector Machine
+
+```{r}
+split=0.70
+trainIndex <- createDataPartition(df_raw$Category, p=split, list=FALSE)
+data_train_svm <- df_raw[ trainIndex,]
+data_train_svm <- data_train_svm[,5:8]
+
+data_test_svm <- df_raw[-trainIndex,]
+
+# train an svm model
+model1 <- svmlight(data_train_svm, as.factor(data_train_svm$Category), pathsvm = getwd())
+
+
+# make predictions
+x_testsvm <- data_test_svm[,6:8]
+y_testsvm <- data_test_svm$Category
+predictionsvm <- predict(model1, x_testsvm)
+
+# summarize results
+confusionMatrix(as.matrix(predictionsvm$class), y_testsvm)
+
+```
+
+## Further Study
+
+To extract the text from the judgements and see how well is SEC doing in terms of detecting frauds and winning the cases.
+
